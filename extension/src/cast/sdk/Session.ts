@@ -3,6 +3,7 @@ import { v4 as uuid } from "uuid";
 import { Logger } from "../../lib/logger";
 
 import pageMessaging from "../pageMessaging";
+import { isUnreachableUrl, resolveCastableMedia } from "../streamUrl";
 import { convertSupportedMediaCommandsFlags } from "../utils";
 
 import type {
@@ -174,9 +175,9 @@ export function createSession(
                     mediaRequests.delete(requestId);
                     resolve();
                 },
-                errorCallback: () => {
+                errorCallback: err => {
                     mediaRequests.delete(requestId);
-                    reject();
+                    reject(err);
                 },
                 message: { ...message, requestId },
                 requestId
@@ -265,7 +266,24 @@ export default class Session {
     #mediaMessageListener = (namespace: string, messageString: string) => {
         if (namespace !== NS_MEDIA) return;
         const message: ReceiverMediaMessage = JSON.parse(messageString);
-        if (message.type !== "MEDIA_STATUS") return;
+        if (message.type !== "MEDIA_STATUS") {
+            /**
+             * LOAD_FAILED, LOAD_CANCELLED, INVALID_REQUEST, etc. Previously
+             * these were ignored, so a failed load never reported back
+             * and the receiver just sat on its idle screen.
+             */
+            const failedRequest = this.#mediaRequests.get(message.requestId);
+            if (failedRequest) {
+                logger.error(
+                    `Media request failed (${message.type})`,
+                    failedRequest.message
+                );
+                failedRequest.errorCallback(
+                    new CastError(ErrorCode.SESSION_ERROR, message.type)
+                );
+            }
+            return;
+        }
 
         for (const status of message.status) {
             let media = this.media.find(
@@ -379,6 +397,42 @@ export default class Session {
 
         this.#loadMediaSuccessCallback = successCallback;
         this.#loadMediaErrorCallback = errorCallback;
+
+        /**
+         * Sites that play video through MSE (hls.js etc.) often pass
+         * the <video> element's blob: URL, which the receiver can't
+         * fetch. Swap in the real stream manifest and fill in a missing
+         * content type so the receiver picks the right player.
+         */
+        const media = loadRequest.media;
+        if (media) {
+            const originalUrl = media.contentUrl || media.contentId;
+            const resolved = resolveCastableMedia(
+                originalUrl,
+                media.contentType
+            );
+            if (resolved) {
+                if (resolved.url !== originalUrl) {
+                    logger.info(
+                        `Replacing uncastable media URL ${originalUrl} with ${resolved.url}`
+                    );
+                    media.contentId = resolved.url;
+                    if (media.contentUrl) media.contentUrl = resolved.url;
+                }
+                media.contentType = resolved.contentType;
+            } else if (isUnreachableUrl(originalUrl)) {
+                logger.error(
+                    `Media URL ${originalUrl} can't be loaded by the receiver and no stream URL was found on the page.`
+                );
+                errorCallback?.(
+                    new CastError(
+                        ErrorCode.SESSION_ERROR,
+                        "Media URL is only accessible within this browser tab."
+                    )
+                );
+                return;
+            }
+        }
 
         loadRequest.sessionId = this.sessionId;
         this.#sendMediaMessage(loadRequest)
