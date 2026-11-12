@@ -103,9 +103,9 @@ export default class MediaSender {
     }
     private receiverListener(availability: ReceiverAvailability) {
         if (this.wasSessionRequested) return;
-        this.wasSessionRequested = false;
 
         if (availability === cast.ReceiverAvailability.AVAILABLE) {
+            this.wasSessionRequested = true;
             cast.requestSession(
                 session => {
                     this.session = session;
